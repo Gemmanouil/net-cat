@@ -1,148 +1,226 @@
-package main // define main package
+package main
 
 import (
-	"bufio"   // buffered I/O
-	"fmt"     // formatted printing
-	"net"     // networking (TCP)
-	"os"      // OS args
-	"strings" // string helpers
-	"time"    // timestamps
+	"bufio"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
 )
 
-// Client holds one user's name and connection
-type Client struct {
-	Name string   // username
-	Conn net.Conn // TCP connection
+const (
+	defaultPort = "8989"
+	maxClients  = 10
+	timeFormat  = "2006-01-02 15:04:05"
+	usage       = "[USAGE]: ./TCPChat $port"
+)
+
+// The logo contains backticks, so those two lines are spliced in
+// with interpreted strings.
+const welcome = `Welcome to TCP-Chat!
+         _nnnn_
+        dGGGGMMb
+       @p~qp~~qMb
+       M|@||@) M|
+       @,----.JM|
+      JS^\__/  qKL
+     dZP        qKRb
+    dZP          qKKb
+   fZP            SMMb
+   HZM            MMMM
+   FqM            MMMM
+ __| ".        |\dS"qML
+ |    ` + "`" + `.       | ` + "`" + `' \Zq
+_)      \.___.,|     .'
+\____   )MMMMMP|   .'
+     ` + "`" + `-'       ` + "`" + `--'
+`
+
+var errNameTaken = errors.New("That name is already taken, choose another one.")
+
+type client struct {
+	name string
+	conn net.Conn
 }
 
-// global slice of all connected clients
-var clients []Client
+// server holds all shared state. Every field below mu must only be
+// touched while holding mu.
+type server struct {
+	mu      sync.Mutex
+	active  int // connections in use (including ones still choosing a name)
+	clients map[net.Conn]*client
+	history []string
+}
 
-// broadcast sends a message to every connected client
-func broadcast(message string) {
-	for _, client := range clients { // loop over all clients
-		client.Conn.Write([]byte(message)) // write message to each connection
+func newServer() *server {
+	return &server{clients: make(map[net.Conn]*client)}
+}
+
+// acquire reserves one of the maxClients slots.
+func (s *server) acquire() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active >= maxClients {
+		return false
+	}
+	s.active++
+	return true
+}
+
+func (s *server) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active--
+}
+
+// prompt prints "[time][name]:" for one client. Caller must hold s.mu.
+func prompt(c *client) {
+	fmt.Fprintf(c.conn, "[%s][%s]:", time.Now().Format(timeFormat), c.name)
+}
+
+// broadcastLocked sends text to everyone except from, then re-prompts them.
+// Caller must hold s.mu. Write errors are ignored on purpose: a dead
+// connection is cleaned up by its own read loop.
+func (s *server) broadcastLocked(from *client, text string) {
+	for _, other := range s.clients {
+		if other == from {
+			continue
+		}
+		fmt.Fprint(other.conn, "\n"+text)
+		prompt(other)
 	}
 }
 
-// privateMessage sends a message only to one target user
-func privateMessage(sender string, target string, message string) {
-	for _, client := range clients { // loop over all clients
-		if client.Name == target { // if name matches target
-			client.Conn.Write([]byte("[PM from " + sender + "] " + message + "\n")) // send private message
-			return                                                                  // stop after first match
+// join registers a client, replays history to it and announces it.
+func (s *server) join(c *client) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, other := range s.clients {
+		if other.name == c.name {
+			return errNameTaken
 		}
+	}
+	for _, line := range s.history {
+		fmt.Fprint(c.conn, line)
+	}
+	s.clients[c.conn] = c
+	s.broadcastLocked(c, c.name+" has joined our chat...\n")
+	prompt(c)
+	return nil
+}
+
+func (s *server) leave(c *client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, c.conn)
+	s.broadcastLocked(c, c.name+" has left our chat...\n")
+}
+
+// post stores and broadcasts one chat message.
+func (s *server) post(c *client, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	line := fmt.Sprintf("[%s][%s]:%s\n", time.Now().Format(timeFormat), c.name, msg)
+	s.history = append(s.history, line)
+	s.broadcastLocked(c, line)
+	prompt(c)
+}
+
+func (s *server) reprompt(c *client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prompt(c)
+}
+
+// readName keeps asking until the client sends a non-empty name.
+func readName(conn net.Conn, r *bufio.Reader) (string, error) {
+	for {
+		fmt.Fprint(conn, "[ENTER YOUR NAME]: ")
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		name := strings.TrimSpace(line)
+		if name != "" {
+			return name, nil
+		}
+		fmt.Fprintln(conn, "Name cannot be empty.")
 	}
 }
 
-// handleClient manages one client in a goroutine
-func handleClient(conn net.Conn) {
-	defer conn.Close() // ensure connection closes when function ends
+func (s *server) handle(conn net.Conn) {
+	defer conn.Close()
+	defer s.release()
 
-	fmt.Println("A client connected!") // log connection
-	conn.Write([]byte("Welcome!\n"))   // greet client
+	fmt.Fprint(conn, welcome)
+	reader := bufio.NewReader(conn)
 
-	reader := bufio.NewReader(conn) // create buffered reader for this connection
-
-	conn.Write([]byte("Enter your name: ")) // ask for name
-	name, _ := reader.ReadString('\n')      // read name line
-	name = strings.TrimSpace(name)          // trim spaces/newline
-
-	fmt.Println("Client name is:", name) // log name
-
-	client := Client{Name: name, Conn: conn} // create Client struct
-	clients = append(clients, client)        // add to global slice
-
-	fmt.Println("Clients online:", len(clients)) // log count
-
-	broadcast(name + " has joined the chat.\n") // announce join to everyone
-
-	for { // main chat loop
-		msg, err := reader.ReadString('\n') // read one line from client
-		if err != nil {                     // if read fails (disconnect)
-			fmt.Println(name, "disconnected.")        // log disconnect
-			broadcast(name + " has left the chat.\n") // announce leave
-			for i, c := range clients {               // loop over clients
-				if c.Conn == conn { // find matching connection
-					clients = append(clients[:i], clients[i+1:]...) // remove from slice
-					break                                           // stop loop
-				}
-			}
-			fmt.Println("Clients online:", len(clients)) // log new count
-			return                                       // end goroutine
+	var c *client
+	for c == nil {
+		name, err := readName(conn, reader)
+		if err != nil {
+			return // disconnected before choosing a name
 		}
-
-		msg = strings.TrimSpace(msg) // trim spaces/newline from message
-
-		if msg == "/quit" || msg == "/exit" { // if user typed quit command
-			fmt.Println(name, "requested to leave.")  // log request
-			broadcast(name + " has left the chat.\n") // announce leave
-			for i, c := range clients {               // loop over clients
-				if c.Conn == conn { // find matching connection
-					clients = append(clients[:i], clients[i+1:]...) // remove from slice
-					break                                           // stop loop
-				}
-			}
-			fmt.Println("Clients online:", len(clients)) // log new count
-			return                                       // end goroutine
+		candidate := &client{name: name, conn: conn}
+		if err := s.join(candidate); err != nil {
+			fmt.Fprintln(conn, err)
+			continue
 		}
+		c = candidate
+	}
+	defer s.leave(c)
+	log.Printf("%s joined (%s)", c.name, conn.RemoteAddr())
 
-		if msg == "/users" { // if user wants list of users
-			conn.Write([]byte("Online users:\n")) // header line
-			for _, c := range clients {           // loop over clients
-				conn.Write([]byte(" - " + c.Name + "\n")) // print each name
-			}
-			continue // skip normal broadcast for this command
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("%s left", c.name)
+			return
 		}
-
-		if strings.HasPrefix(msg, "@") { // if message starts with '@' (private)
-			parts := strings.SplitN(msg, " ", 2) // split into "@user" and rest
-			if len(parts) == 2 {                 // ensure we have both parts
-				target := parts[0][1:]                // remove '@' from username
-				message := parts[1]                   // private message text
-				privateMessage(name, target, message) // send private message
-			} else { // invalid format
-				conn.Write([]byte("Invalid private message format. Use: @username message\n")) // show help
-			}
-			continue // skip normal broadcast
+		msg := strings.TrimSpace(line)
+		if msg == "" {
+			s.reprompt(c) // never broadcast empty messages
+			continue
 		}
-
-		timestamp := time.Now().Format("15:04") // get current time HH:MM
-
-		broadcast("[" + timestamp + "] " + name + ": " + msg + "\n") // send formatted message to all
+		s.post(c, msg)
 	}
 }
 
 func main() {
-	port := "8989" // default port
-
-	argsCount := len(os.Args) // number of CLI args
-
-	if argsCount > 2 { // too many args
-		fmt.Println("[USAGE]: ./TCPChat $port") // usage message
-		return                                  // exit
+	port := defaultPort
+	switch len(os.Args) {
+	case 1:
+	case 2:
+		port = os.Args[1]
+	default:
+		fmt.Println(usage)
+		return
 	}
 
-	if argsCount == 2 { // if user provided port
-		port = os.Args[1] // override default port
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("cannot listen on port %s: %v", port, err)
 	}
+	defer listener.Close()
+	fmt.Println("Listening on the port :" + port)
 
-	fmt.Println("Server starting on port", port) // log startup
-
-	listener, err := net.Listen("tcp", "localhost:"+port) // start TCP listener
-	if err != nil {                                       // if listen fails
-		fmt.Println("Error cannot open port:", err) // log error
-		return                                      // exit
-	}
-	defer listener.Close() // ensure listener closes on exit
-
-	for { // accept loop
-		conn, err := listener.Accept() // wait for new connection
-		if err != nil {                // if accept fails
-			fmt.Println("Error accepting connection:", err) // log error
-			continue                                        // try next
+	srv := newServer()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("accept error: %v", err)
+			continue
 		}
-
-		go handleClient(conn) // start goroutine for this client
+		if !srv.acquire() {
+			fmt.Fprintln(conn, "Chat is full (max 10 connections), try again later.")
+			conn.Close()
+			continue
+		}
+		go srv.handle(conn)
 	}
 }
