@@ -109,7 +109,7 @@ func (s *server) join(c *client) error {
 		fmt.Fprint(c.conn, line)
 	}
 	s.clients[c.conn] = c
-	s.broadcastLocked(c, c.name+" has joined our chat...\n")
+	s.broadcastLocked(c, c.name+" has joined the chat...\n")
 	prompt(c)
 	return nil
 }
@@ -118,7 +118,7 @@ func (s *server) leave(c *client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.clients, c.conn)
-	s.broadcastLocked(c, c.name+" has left our chat...\n")
+	s.broadcastLocked(c, c.name+" has left the chat...\n")
 }
 
 // post stores and broadcasts one chat message.

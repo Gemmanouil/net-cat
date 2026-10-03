@@ -1,110 +1,91 @@
-TCPChat — Multi‑Client TCP Chat Server (Go)
+# TCPChat: Multi-Client TCP Chat Server (Go)
 
-A simple but fully functional multi‑client chat server written in Go.
-Clients connect using Netcat (nc) or Telnet and can chat in real time.
+A group chat server written in Go that recreates the core idea of NetCat in a
+server-client architecture. Clients connect with `nc` (Netcat) and chat in real time.
 
-This project was built step‑by‑step while learning Go networking, concurrency, and TCP communication.
+Built while learning Go networking, goroutines, and mutexes, using only the
+standard library.
 
-FEATURES IMPLEMENTED (Up to Step 10)
+## Features
 
-✔ Multi‑Client Support
-The server accepts unlimited clients using net.Listen and goroutines.
+- **TCP server with multiple clients** (1 server to many clients), one goroutine per client.
+- **Name required:** the client is greeted with a Linux logo and must enter a
+  non-empty, unique name.
+- **Connection limit:** maximum 10 simultaneous connections; extra clients are told the chat is full.
+- **Timestamped messages:** every message is formatted as
+  `[2026-09-29 18:34:23][name]:message`.
+- **Empty messages are ignored:** they are never broadcast.
+- **Message history:** a client that joins receives all previous chat messages.
+- **Join and leave notices:** the other clients are informed when someone joins or leaves.
+- **Clean disconnects:** when a client leaves, everyone else stays connected.
+- **Safe concurrency:** all shared state (clients, history, connection count) is protected by a `sync.Mutex`.
+- **Default port 8989**, or a custom port as the first argument.
 
-✔ Username System
-Each client is asked to enter a name when connecting.
+## Requirements
 
-✔ Broadcasting
-Messages are sent to all connected clients.
+- Go 1.18+
+- `nc` (Netcat) to connect as a client
 
-✔ Join & Leave Announcements
-When a user joins or leaves, all clients are notified.
+## Build and run
 
-✔ Clean Disconnect
-Users can leave using:
-/quit
-/exit
+```bash
+go mod init TCPChat        # only once, if there is no go.mod yet
+go build -o TCPChat .
 
-The server removes them from the active client list.
+./TCPChat                  # listens on :8989
+./TCPChat 2525             # listens on :2525
+./TCPChat 2525 localhost   # prints: [USAGE]: ./TCPChat $port
+```
 
-✔ Online User List
-Users can see who is online using:
-/users
+For development you can also use `go run . 2525`, or `go run -race . 2525`
+to detect data races.
 
-✔ Private Messaging
-Send a private message to a specific user:
-@username message
+## Connect as a client
 
-✔ Timestamps
-All messages include a timestamp in HH:MM format.
+```bash
+nc localhost 8989          # or the custom port you chose
+```
 
-✔ Ghost‑User Prevention
-Disconnected users are removed from the clients slice.
+Each terminal running `nc` is a separate chat client. Press `Ctrl+C` to leave.
 
-COMMANDS
+## Example
 
-/quit      Disconnect from the chat
-/exit      Same as /quit
-/users     Show all online users
-@name msg  Send a private message to a specific user
+```
+$ nc localhost 2525
+Welcome to TCP-Chat!
+         _nnnn_
+        dGGGGMMb
+        ...
+[ENTER YOUR NAME]: Yenlik
+[2026-09-29 16:03:43][Yenlik]:hello
+Lee has joined our chat...
+[2026-09-29 16:04:32][Lee]:Hi everyone!
+Lee has left our chat...
+```
 
-HOW TO RUN THE SERVER
+## How it works
 
-Build the program:
-go build -o TCPChat
+1. The server listens with `net.Listen` and accepts connections in a loop.
+2. Before starting a goroutine, it reserves one of the 10 connection slots.
+   If none is free, the client is told the chat is full and disconnected.
+3. Each client goroutine sends the logo, asks for a name until it is valid,
+   then registers the client.
+4. On joining, the server replays the message history to the new client and
+   announces the join to everyone else.
+5. Each line a client sends is trimmed; empty lines are dropped, other lines are
+   timestamped, stored in the history, and broadcast to the other clients.
+6. When the connection closes, the client is removed and the others are notified.
 
-Run the server (default port 8989):
-./TCPChat
+Shared data is only touched while holding the server mutex, so joins, leaves
+and broadcasts from different goroutines cannot corrupt each other.
 
-Run the server on a custom port:
-./TCPChat 8080
+## Allowed packages used
 
-HOW TO CONNECT AS A CLIENT
+`bufio`, `errors`, `fmt`, `log`, `net`, `os`, `strings`, `sync`, `time`
 
-Open a terminal and run:
+## Possible extensions
 
-nc localhost 8989
-
-Or if using a custom port:
-
-nc localhost 8080
-
-Each terminal acts as a separate chat client.
-
-HOW IT WORKS (Short Explanation)
-
-The server listens for TCP connections.
-
-Each new client is handled in a separate goroutine.
-
-Clients are stored in a global slice.
-
-Messages are read using bufio.Reader.
-
-Broadcasting loops through all connected clients.
-
-Disconnects remove the client from the slice.
-
-Commands are parsed before broadcasting.
-
-Private messages are sent only to the target user.
-
-Timestamps are added using time.Now().Format("15:04").
-
-REQUIREMENTS
-
-Go 1.18+
-
-Netcat (nc) or Telnet
-
-Username colors
-
-Message history
-
-Admin commands
-
-Max client limit
-
-Rate limiting
-
-Logging system
-
+- Clients can change their name, with a notice to the group
+- Saving all logs to a file
+- Multiple chat rooms
+- Unit tests for the server and client
